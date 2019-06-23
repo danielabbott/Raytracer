@@ -1,15 +1,24 @@
+/*
+Camera 2 units wide, centred at (0,0,-1).
+Rays originate from (0,0,0) and pass through camera plane ^
+Scene is rendered in chunks. For every pixel in a chunk the ray is tested for intersections against
+every object in the scene. Each intersection is recorded. Another pass is done on the chunk which takes
+that intersection data and applies lighting.
+*/
+
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
 #include <stdio.h>
+#include <stdbool.h>
 #include "raytrace.h"
 
 typedef struct RAYHITINFO
 {
 	// colour of object at position the ray intersected. 
 	uint32_t colour; // if alpha = 0, the ray did not hit an object
-	float position[3]; // position ray hit the object
+	float position[3]; // position ray hit the object (world space)
 	uint32_t pixelX;
 	uint32_t pixelY;
 	uint16_t shape;
@@ -89,6 +98,7 @@ typedef struct RAYHITINFO
 #define max_ps _mm256_max_ps
 #define min_ps _mm256_min_ps
 #define rcp_ps _mm256_rcp_ps
+#define get1_ss _mm256_cvtss_f32
 
 
 #else
@@ -99,7 +109,7 @@ typedef struct RAYHITINFO
 #define vec_t float
 #define COMPARISON_TYPE uint32_t
 
-static inline vec_t mul_ps(vec_t a, vec_t b) { return a*b; }
+static inline vec_t mul_ps(vec_t a, vec_t b) { return a * b; }
 static inline vec_t add_ps(vec_t a, vec_t b) { return a + b; }
 static inline vec_t sub_ps(vec_t a, vec_t b) { return a - b; }
 static inline void store_ps(vec_t * ptr, vec_t a) { *ptr = a; }
@@ -120,6 +130,7 @@ static inline vec_t absolute_vector_components(vec_t a) { return a >= 0 ? a : -a
 #if SIMD == SSE || SIMD == AVX
 vec_t absolute_vector_components(vec_t a)
 {
+	// Clears sign bit
 	return xor_ps(a, set1_ps(-0.0f));
 }
 #endif
@@ -130,18 +141,6 @@ vec_t absolute_vector_components(vec_t a)
 #else
 #define ALIGN_PREFIX
 #define ALIGN_SUFFIX __attribute__((align(VEC_T_SIZE)))
-#endif
-
-#if SIMD == AVX
-
-/* It would seem that there is no intrinsic for this */
-
-static inline float get1_ss(vec_t a) {
-	ALIGN_PREFIX float f[ELEMENTS_PER_VECTOR] ALIGN_SUFFIX;
-	store_ps(f, a);
-	return f[0];
-}
-
 #endif
 
 #ifdef DEBUG
@@ -168,7 +167,7 @@ void raytracer_create(RAYTRACER * rt)
 	if (!rt->imageWidth || !rt->imageHeight || (rt->imageWidth % ELEMENTS_PER_VECTOR))
 		return;
 
-	if(!rt->pixels) {
+	if (!rt->pixels) {
 		rt->pixels = malloc(rt->imageWidth * rt->imageHeight * 4);
 		for (unsigned int i = 0; i < rt->imageHeight * rt->imageHeight; i++)
 			rt->pixels[i] = 0xff000000;
@@ -192,12 +191,13 @@ void raytracer_create(RAYTRACER * rt)
 }
 
 /* Returns the first intersection with a sphere for each ray */
-/* nearestIntersections should be an array of length ELEMENTS_PER_VECTOR */
+/* nearestIntersections,intersectionMaterials,intersectionShapeIndex should be arrays of length ELEMENTS_PER_VECTOR */
+/* nearestIntersections, intersectionMaterials, intersectionShapeIndex are the output */
 /* ignore should point to an unsigned int array of length ELEMENTS_PER_VECTOR. To specifiy that no sphere should be ignored, set ignore[x] to -1 */
 static void do_sphere_intersection(RAYTRACER * rt,
 	float * nearestIntersections, MATERIAL * intersectionMaterials, int * intersectionShapeIndex,
 	vec_t rayOriginX, vec_t rayOriginY, vec_t rayOriginZ,
-	vec_t rayDirectionX, vec_t rayDirectionY, vec_t rayDirectionZ, unsigned int * ignore)
+	vec_t rayDirectionX, vec_t rayDirectionY, vec_t rayDirectionZ, int * ignore)
 {
 	for (unsigned int i = 0; i < rt->spheresCount; i++) {
 		// ray-sphere intersection
@@ -227,7 +227,7 @@ static void do_sphere_intersection(RAYTRACER * rt,
 		ALIGN_PREFIX COMPARISON_TYPE comparison[ELEMENTS_PER_VECTOR] ALIGN_SUFFIX;
 #endif
 
-		int atLeastOneRayHasASolution = 0;
+		int atLeastOneRayHasASolution = false;
 
 		// compare discriminants to 0
 #if SIMD == SSE
@@ -241,7 +241,7 @@ static void do_sphere_intersection(RAYTRACER * rt,
 #if SIMD != NONE
 		for (unsigned int j = 0; j < ELEMENTS_PER_VECTOR; j++) {
 			if (comparison[j] != 0) {
-				atLeastOneRayHasASolution = 1;
+				atLeastOneRayHasASolution = true;
 				break;
 			}
 		}
@@ -264,22 +264,22 @@ static void do_sphere_intersection(RAYTRACER * rt,
 			store_ps(solution2, div_ps(sub_ps(negB, sqrtDiscrim), denominator));
 
 			for (unsigned int j = 0; j < ELEMENTS_PER_VECTOR; j++) {
-				if(ignore[j] != i){
+				if (ignore[j] != i) {
 #if SIMD != NONE
-				if (comparison[j]) {
+					if (comparison[j]) {
 #endif
-					/* Store largest solution */
+						/* Store largest solution */
 
-					float solution = solution1[j];
+						float solution = solution1[j];
 
-					if(solution < 0 || (solution2[j] > 0 && solution2[j] < solution))
-						solution = solution2[j];					
+						if (solution < 0 || (solution2[j] > 0 && solution2[j] < solution))
+							solution = solution2[j];
 
-					if (solution > 0 && solution < nearestIntersections[j]) {
-						nearestIntersections[j] = solution;
-						intersectionMaterials[j].colour = rt->spheres[i].colour;
-						intersectionShapeIndex[j] = i;
-					}
+						if (solution > 0 && solution < nearestIntersections[j]) {
+							nearestIntersections[j] = solution;
+							intersectionMaterials[j].colour = rt->spheres[i].colour;
+							intersectionShapeIndex[j] = i;
+						}
 #if SIMD != NONE
 					}
 #endif
@@ -291,12 +291,13 @@ static void do_sphere_intersection(RAYTRACER * rt,
 }
 
 /* Returns the first intersection with a plane for each ray */
-/* nearestIntersections should be an array of length ELEMENTS_PER_VECTOR */
+/* intersections,intersectionMaterials,intersectionShapeIndex should be arrays of length ELEMENTS_PER_VECTOR */
+/* nearestIntersections, intersectionMaterials, intersectionShapeIndex are the output */
 /* ignore should point to an unsigned int array of length ELEMENTS_PER_VECTOR. To specifiy that no plane should be ignored, set ignore[x] to -1 */
 static void do_plane_intersection(RAYTRACER * rt,
-	float * nearestIntersections, MATERIAL * intersectionMaterials, int * intersectionShapeIndex,
+	float * intersections, MATERIAL * intersectionMaterials, int * intersectionShapeIndex,
 	vec_t rayOriginX, vec_t rayOriginY, vec_t rayOriginZ,
-	vec_t rayDirectionX, vec_t rayDirectionY, vec_t rayDirectionZ, unsigned int * ignore)
+	vec_t rayDirectionX, vec_t rayDirectionY, vec_t rayDirectionZ, int * ignore)
 {
 	for (unsigned int i = 0; i < rt->planesCount; i++) {
 		// t = ((p0) * n) / (l * n)
@@ -358,8 +359,8 @@ static void do_plane_intersection(RAYTRACER * rt,
 #if SIMD != NONE
 					if (comparison[j]) {
 #endif
-						if (solution[j] > 0 && solution[j] < nearestIntersections[j]) {
-							nearestIntersections[j] = solution[j];
+						if (solution[j] > 0 && solution[j] < intersections[j]) {
+							intersections[j] = solution[j];
 							intersectionMaterials[j].colour = rt->planes[i].colour;
 							intersectionShapeIndex[j] = i;
 						}
@@ -379,13 +380,15 @@ void apply_point_lights(RAYTRACER * rt, RAYHITINFO * rayHitInfo, unsigned int ra
 
 	/* Find surface normal */
 
-	ALIGN_PREFIX float x_floats[ELEMENTS_PER_VECTOR] ALIGN_SUFFIX = {0};
-	ALIGN_PREFIX float y_floats[ELEMENTS_PER_VECTOR] ALIGN_SUFFIX = {0};
-	ALIGN_PREFIX float z_floats[ELEMENTS_PER_VECTOR] ALIGN_SUFFIX = {0};
+	ALIGN_PREFIX float x_floats[ELEMENTS_PER_VECTOR] ALIGN_SUFFIX = { 0 };
+	ALIGN_PREFIX float y_floats[ELEMENTS_PER_VECTOR] ALIGN_SUFFIX = { 0 };
+	ALIGN_PREFIX float z_floats[ELEMENTS_PER_VECTOR] ALIGN_SUFFIX = { 0 };
 
 
 	for (unsigned int i = 0; i < rayCount; i++) {
 		if (rayHitInfo[i].shape == SHAPE_SPHERE) { /* Sphere */
+			// Normal = norm(intersect - origin)
+
 			float px = rayHitInfo[i].position[0];
 			float py = rayHitInfo[i].position[1];
 			float pz = rayHitInfo[i].position[2];
@@ -394,11 +397,11 @@ void apply_point_lights(RAYTRACER * rt, RAYHITINFO * rayHitInfo, unsigned int ra
 			py -= rt->spheres[rayHitInfo[i].shapeIndex].position[1];
 			pz -= rt->spheres[rayHitInfo[i].shapeIndex].position[2];
 
-			float len = (float)sqrt(px*px + py*py + pz*pz);
+			float lenR = 1.0f / (float)sqrt(px*px + py*py + pz*pz);
 
-			x_floats[i] = px / len;
-			y_floats[i] = py / len;
-			z_floats[i] = pz / len;
+			x_floats[i] = px * lenR;
+			y_floats[i] = py * lenR;
+			z_floats[i] = pz * lenR;
 		}
 		else if (rayHitInfo[i].shape == SHAPE_PLANE) { /* Plane */
 			x_floats[i] = rt->planes[rayHitInfo[i].shapeIndex].normal[0];
@@ -418,17 +421,11 @@ void apply_point_lights(RAYTRACER * rt, RAYHITINFO * rayHitInfo, unsigned int ra
 
 	for (unsigned int i = 0; i < rayCount; i++) {
 		x_floats[i] = rayHitInfo[i].position[0];
-	}
-	vec_t intersectX = load_ps(x_floats);
-
-	for (unsigned int i = 0; i < rayCount; i++) {
 		y_floats[i] = rayHitInfo[i].position[1];
-	}
-	vec_t intersectY = load_ps(y_floats);
-
-	for (unsigned int i = 0; i < rayCount; i++) {
 		z_floats[i] = rayHitInfo[i].position[2];
 	}
+	vec_t intersectX = load_ps(x_floats);
+	vec_t intersectY = load_ps(y_floats);
 	vec_t intersectZ = load_ps(z_floats);
 
 	float r[ELEMENTS_PER_VECTOR] = { 0 };
@@ -445,9 +442,9 @@ void apply_point_lights(RAYTRACER * rt, RAYHITINFO * rayHitInfo, unsigned int ra
 	ALIGN_PREFIX float newGreen[ELEMENTS_PER_VECTOR] ALIGN_SUFFIX;
 	ALIGN_PREFIX float newBlue[ELEMENTS_PER_VECTOR] ALIGN_SUFFIX;
 
-	memset(newRed, 0, ELEMENTS_PER_VECTOR * 4);
-	memset(newGreen, 0, ELEMENTS_PER_VECTOR * 4);
-	memset(newBlue, 0, ELEMENTS_PER_VECTOR * 4);
+	memset(newRed, 0, ELEMENTS_PER_VECTOR * sizeof(float));
+	memset(newGreen, 0, ELEMENTS_PER_VECTOR * sizeof(float));
+	memset(newBlue, 0, ELEMENTS_PER_VECTOR * sizeof(float));
 
 	for (unsigned int i = 0; i < rt->pointLightsCount; i++) {
 		/* Get light position */
@@ -475,7 +472,7 @@ void apply_point_lights(RAYTRACER * rt, RAYHITINFO * rayHitInfo, unsigned int ra
 		vec_t objectToLightZNormalised = mul_ps(objectToLightZ, multiplier);
 
 #ifndef DISABLE_SHADOWS
-
+		
 		/* Check for objects casting a shadow */
 
 
@@ -545,9 +542,8 @@ void apply_point_lights(RAYTRACER * rt, RAYHITINFO * rayHitInfo, unsigned int ra
 
 		// dot(objectSuraceNormal, objectToLight)
 
-		vec_t intensity = add_ps(add_ps(mul_ps(objectSuraceNormalX, objectToLightXNormalised),
-			mul_ps(objectSuraceNormalY, objectToLightYNormalised)),
-			mul_ps(objectSuraceNormalZ, objectToLightZNormalised));
+		vec_t intensity = dot(objectSuraceNormalX, objectSuraceNormalY, objectSuraceNormalZ, 
+			objectToLightXNormalised, objectToLightYNormalised, objectToLightZNormalised);
 
 		ALIGN_PREFIX float floats[ELEMENTS_PER_VECTOR] ALIGN_SUFFIX;
 
@@ -573,9 +569,7 @@ void apply_point_lights(RAYTRACER * rt, RAYHITINFO * rayHitInfo, unsigned int ra
 
 		/* Get length of object->light vector */
 
-		vec_t distanceToLight = sqrt_ps(add_ps(add_ps(mul_ps(objectToLightX, objectToLightX),
-			mul_ps(objectToLightY, objectToLightY)),
-			mul_ps(objectToLightZ, objectToLightZ)));
+		vec_t distanceToLight = lightRayLength;
 
 		distanceToLight = max_ps(set1_ps(0.00001f), distanceToLight);
 
@@ -609,37 +603,38 @@ void apply_point_lights(RAYTRACER * rt, RAYHITINFO * rayHitInfo, unsigned int ra
 }
 
 static inline void raytracer_render_(RAYTRACER * rt, float pixelXCamSpaceOffset, float pixelYCamSpaceOffset,
-	float pixelXCamSpaceOffsetMultipled, RAYHITINFO * rayHitInfo,
-	unsigned int x, unsigned int y, unsigned int w, unsigned int h)
+	RAYHITINFO * rayHitInfo, unsigned int x, unsigned int y, unsigned int w, unsigned int h)
 {
-	assert(w && h && pixelXCamSpaceOffset && pixelYCamSpaceOffset && pixelXCamSpaceOffsetMultipled);
+	assert(w && h && pixelXCamSpaceOffset > 0 && pixelYCamSpaceOffset > 0);
 
 	unsigned int rayHitInfoCount = 0;
 
 	/* Cast initial rays */
 
 	float aspect = rt->imageWidth / (float)rt->imageHeight;
-	float pixelYCamSpace = 1/aspect - pixelYCamSpaceOffset * y;
+	float pixelYCamSpace = 1 / aspect - pixelYCamSpaceOffset * y;
+
+	ALIGN_PREFIX float pixelCamSpaceX[ELEMENTS_PER_VECTOR] ALIGN_SUFFIX;
 
 	unsigned int pixelIndex = 0;
 	for (unsigned int pixelY = 0; pixelY < h; pixelY++) {
 
-		ALIGN_PREFIX float pixelCamSpaceX[ELEMENTS_PER_VECTOR] ALIGN_SUFFIX;
-
-		pixelCamSpaceX[0] = -1 + pixelXCamSpaceOffset*x;
-#if ELEMENTS_PER_VECTOR > 1
-		pixelCamSpaceX[1] = -1 + pixelXCamSpaceOffset + pixelXCamSpaceOffset*x;
-		pixelCamSpaceX[2] = -1 + pixelXCamSpaceOffset * 2 + pixelXCamSpaceOffset*x;
-		pixelCamSpaceX[3] = -1 + pixelXCamSpaceOffset * 3 + pixelXCamSpaceOffset*x;
-#if ELEMENTS_PER_VECTOR > 4
-		pixelCamSpaceX[4] = -1 + pixelXCamSpaceOffset * 4 + pixelXCamSpaceOffset*x;
-		pixelCamSpaceX[5] = -1 + pixelXCamSpaceOffset * 5 + pixelXCamSpaceOffset*x;
-		pixelCamSpaceX[6] = -1 + pixelXCamSpaceOffset * 6 + pixelXCamSpaceOffset*x;
-		pixelCamSpaceX[7] = -1 + pixelXCamSpaceOffset * 7 + pixelXCamSpaceOffset*x;
-#endif
-#endif
-
 		for (unsigned int pixelX = 0; pixelX < w; pixelX += X_INCREMENT, pixelIndex += X_INCREMENT) {
+
+
+			pixelCamSpaceX[0] = -1.0f + pixelXCamSpaceOffset * (x + pixelX);
+#if ELEMENTS_PER_VECTOR > 1
+			pixelCamSpaceX[1] = -1.0f + pixelXCamSpaceOffset * (x + pixelX + 1);
+			pixelCamSpaceX[2] = -1.0f + pixelXCamSpaceOffset * (x + pixelX + 2);
+			pixelCamSpaceX[3] = -1.0f + pixelXCamSpaceOffset * (x + pixelX + 3);
+#if ELEMENTS_PER_VECTOR > 4
+			pixelCamSpaceX[4] = -1.0f + pixelXCamSpaceOffset * (x + pixelX + 4);
+			pixelCamSpaceX[5] = -1.0f + pixelXCamSpaceOffset * (x + pixelX + 5);
+			pixelCamSpaceX[6] = -1.0f + pixelXCamSpaceOffset * (x + pixelX + 6);
+			pixelCamSpaceX[7] = -1.0f + pixelXCamSpaceOffset * (x + pixelX + 7);
+#endif
+#endif
+
 			vec_t rayDirectionX = load_ps(pixelCamSpaceX);
 			vec_t rayDirectionY = set1_ps(pixelYCamSpace);
 			float neg1 = -1;
@@ -670,7 +665,7 @@ static inline void raytracer_render_(RAYTRACER * rt, float pixelXCamSpaceOffset,
 
 			const vec_t zero = setzero_ps();
 
-			unsigned int ignore[ELEMENTS_PER_VECTOR];
+			int ignore[ELEMENTS_PER_VECTOR];
 			memset(ignore, 0xff, ELEMENTS_PER_VECTOR * sizeof(unsigned int));
 
 			do_sphere_intersection(rt, nearestIntersections, intersectionMaterials, intersectionShapeIndex,
@@ -679,7 +674,7 @@ static inline void raytracer_render_(RAYTRACER * rt, float pixelXCamSpaceOffset,
 
 			for (unsigned int i = 0; i < ELEMENTS_PER_VECTOR; i++) {
 				if (nearestIntersections[i] < INFINITY)
-					intersectionType[i] = 1; // Sphere
+					intersectionType[i] = SHAPE_SPHERE;
 			}
 
 			do_plane_intersection(rt, nearestIntersections, intersectionMaterials, intersectionShapeIndex,
@@ -687,23 +682,23 @@ static inline void raytracer_render_(RAYTRACER * rt, float pixelXCamSpaceOffset,
 				rayDirectionX, rayDirectionY, rayDirectionZ, ignore);
 
 			for (unsigned int i = 0; i < ELEMENTS_PER_VECTOR; i++) {
-				if (!intersectionType[i] && nearestIntersections[i] < INFINITY)
-					intersectionType[i] = 2; // Plane
+				if (nearestIntersections[i] < INFINITY && !intersectionType[i])
+					intersectionType[i] = SHAPE_PLANE;
 			}
 
 			/* Store the intersection data for batch processing */
 
+			ALIGN_PREFIX float rayDirectionX_floats[ELEMENTS_PER_VECTOR] ALIGN_SUFFIX;
+			store_ps(rayDirectionX_floats, rayDirectionX);
+
 			for (int i = 0; i < ELEMENTS_PER_VECTOR; i++) {
 				if (nearestIntersections[i] < INFINITY) {
-					rayHitInfo[rayHitInfoCount].pixelX = pixelX + i;
-					rayHitInfo[rayHitInfoCount].pixelY = pixelY;
+					rayHitInfo[rayHitInfoCount].pixelX = x + pixelX + i;
+					rayHitInfo[rayHitInfoCount].pixelY = y + pixelY;
 
 					rayHitInfo[rayHitInfoCount].shape = (uint16_t)intersectionType[i];
 					rayHitInfo[rayHitInfoCount].shapeIndex = (uint16_t)intersectionShapeIndex[i];
 
-
-					ALIGN_PREFIX float rayDirectionX_floats[ELEMENTS_PER_VECTOR] ALIGN_SUFFIX;
-					store_ps(rayDirectionX_floats, rayDirectionX);
 
 					// direction * t = point of intersection in 3d space
 					float px = rayDirectionX_floats[i] * nearestIntersections[i];
@@ -721,66 +716,54 @@ static inline void raytracer_render_(RAYTRACER * rt, float pixelXCamSpaceOffset,
 
 						float c = rt->planes[rayHitInfo[rayHitInfoCount].shapeIndex].chequered;
 
-						int x = round(px / c);
-						int z = round(pz / c);
+						int x = (int)round(px / c);
+						int z = (int)round(pz / c);
 
-						if (x < 0) x -= c;
-						
+						if (x < 0) x -= (int)c;
+
 						if ((abs(x) % 2) ^ (abs(z) % 2)) {
 							black = 1;
 						}
 					}
 
 					rayHitInfo[rayHitInfoCount].colour = black ? 0xff000000 : intersectionMaterials[i].colour;
-					
+
 					rayHitInfoCount++;
 				}
 			}
-
-			pixelCamSpaceX[0] += pixelXCamSpaceOffsetMultipled;
-#if ELEMENTS_PER_VECTOR > 1
-			pixelCamSpaceX[1] += pixelXCamSpaceOffsetMultipled;
-			pixelCamSpaceX[2] += pixelXCamSpaceOffsetMultipled;
-			pixelCamSpaceX[3] += pixelXCamSpaceOffsetMultipled;
-#if ELEMENTS_PER_VECTOR > 4
-			pixelCamSpaceX[4] += pixelXCamSpaceOffsetMultipled;
-			pixelCamSpaceX[5] += pixelXCamSpaceOffsetMultipled;
-			pixelCamSpaceX[6] += pixelXCamSpaceOffsetMultipled;
-			pixelCamSpaceX[7] += pixelXCamSpaceOffsetMultipled;
-#endif
-#endif
 		}
 		pixelYCamSpace -= pixelYCamSpaceOffset;
 	}
 
+
 	/* Apply point lights in batches */
+	/* (For better SIMD utilisation - rays with that intersected are grouped together) */
 
 	unsigned int rayHitsRemaining = rayHitInfoCount;
-	RAYHITINFO * rayHits = rayHitInfo;
 
 	while (rayHitsRemaining >= ELEMENTS_PER_VECTOR) {
-		apply_point_lights(rt, rayHits, ELEMENTS_PER_VECTOR);
+		apply_point_lights(rt, rayHitInfo, ELEMENTS_PER_VECTOR);
 
 		for (unsigned int j = 0; j < ELEMENTS_PER_VECTOR; j++) {
-			unsigned int px = rayHits[j].pixelX;
-			unsigned int py = rayHits[j].pixelY;
-			assert((y + py) * rt->pixelsStride + x + px < rt->imageWidth * rt->imageHeight);
-			rt->pixels[(y + py) * rt->pixelsStride + x + px] = rayHits[j].colour;
+			unsigned int px = rayHitInfo[j].pixelX;
+			unsigned int py = rayHitInfo[j].pixelY;
+			assert(py * rt->pixelsStride + px < rt->imageWidth * rt->imageHeight);
+			rt->pixels[py * rt->pixelsStride + px] = rayHitInfo[j].colour;
 		}
 
-		rayHits += ELEMENTS_PER_VECTOR;
+		rayHitInfo += ELEMENTS_PER_VECTOR;
 		rayHitsRemaining -= ELEMENTS_PER_VECTOR;
 	}
 
 #if SIMD != NONE
 	if (rayHitsRemaining) {
-		apply_point_lights(rt, rayHits, rayHitsRemaining);
+		apply_point_lights(rt, rayHitInfo, rayHitsRemaining);
 
 		for (unsigned int j = 0; j < rayHitsRemaining; j++) {
-			unsigned int px = rayHits[j].pixelX;
-			unsigned int py = rayHits[j].pixelY;
-			assert((y + py) * rt->pixelsStride + x + px < rt->imageWidth * rt->imageHeight);
-			rt->pixels[(y + py) * rt->pixelsStride + x + px] = rayHits[j].colour;
+			unsigned int px = rayHitInfo[j].pixelX;
+			unsigned int py = rayHitInfo[j].pixelY;
+			assert(py * rt->pixelsStride + px < rt->imageWidth * rt->imageHeight);
+			rt->pixels[py * rt->pixelsStride + px] = rayHitInfo[j].colour;
 		}
 	}
 #endif
@@ -789,26 +772,24 @@ static inline void raytracer_render_(RAYTRACER * rt, float pixelXCamSpaceOffset,
 
 void raytracer_render(RAYTRACER * rt)
 {
-	float aspect = rt->imageWidth / (float)rt->imageHeight;
-
 	float pixelXCamSpaceOffset = 2 / (float)rt->imageWidth;
-	float pixelXCamSpaceOffsetMultipled = pixelXCamSpaceOffset * ELEMENTS_PER_VECTOR;
 
-	float pixelYCamSpaceOffset = 2.0f / ((float)rt->imageHeight * aspect);
+	float pixelYCamSpaceOffset = (2.0f / ((float)rt->imageWidth / (float)rt->imageHeight)) / (float)rt->imageHeight;
 
 	RAYHITINFO * rayHitInfo = malloc(CHUNK_SIZE * CHUNK_SIZE * sizeof(RAYHITINFO));
 
 	int rowsToGo = rt->imageHeight;
 	unsigned int y = 0;
 
-	while (rowsToGo) {
+	while (rowsToGo > 0) {
 		unsigned int areaHeight = rowsToGo > CHUNK_SIZE ? CHUNK_SIZE : rowsToGo;
 		unsigned int x = 0;
 		int columnsToGo = rt->imageWidth;
-		unsigned int areaWidth = columnsToGo > CHUNK_SIZE ? CHUNK_SIZE : columnsToGo;
 
-		while (columnsToGo) {
-			raytracer_render_(rt, pixelXCamSpaceOffset, pixelYCamSpaceOffset, pixelXCamSpaceOffsetMultipled, rayHitInfo, x, y, areaWidth, areaHeight);
+		while (columnsToGo > 0) {
+			unsigned int areaWidth = columnsToGo > CHUNK_SIZE ? CHUNK_SIZE : columnsToGo;
+
+			raytracer_render_(rt, pixelXCamSpaceOffset, pixelYCamSpaceOffset, rayHitInfo, x, y, areaWidth, areaHeight);
 			x += areaWidth;
 			columnsToGo -= areaWidth;
 		}

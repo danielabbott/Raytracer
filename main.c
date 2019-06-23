@@ -30,9 +30,9 @@ SPHERE sphere[4] = {
 };
 
 POINT_LIGHT plight = {
-	.colour = 0xffd0d0d0,
+	.colour = 0xffe0e0e0,
 	.position = { 0 ,1, 0 },
-	.attenuation = 0.1f
+	.attenuation = 0.4f
 };
 
 PLANE plane = {
@@ -45,11 +45,11 @@ PLANE plane = {
 int main(void)
 {
 
-#define IMAGE_W 512
+#define IMAGE_W 1024
 #define IMAGE_H 512
 
 	RAYTRACER rt;
-	rt.pixels = 0;
+	rt.pixels = NULL;
 	rt.imageWidth = IMAGE_W;
 	rt.imageHeight = IMAGE_H;
 	rt.pixelsStride = IMAGE_W;
