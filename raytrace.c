@@ -51,7 +51,6 @@ typedef struct RAYHITINFO
 #endif
 
 #if SIMD == SSE
-#define X_INCREMENT 4
 #define ELEMENTS_PER_VECTOR 4
 #define VEC_T_SIZE 16
 #define vec_t __m128
@@ -78,7 +77,6 @@ typedef struct RAYHITINFO
 #define get1_ss _mm_cvtss_f32
 
 #elif SIMD == AVX
-#define X_INCREMENT 8
 #define ELEMENTS_PER_VECTOR 8
 #define VEC_T_SIZE 32
 #define vec_t __m256
@@ -103,7 +101,6 @@ typedef struct RAYHITINFO
 
 #else
 
-#define X_INCREMENT 1
 #define ELEMENTS_PER_VECTOR 1
 #define VEC_T_SIZE 4
 #define vec_t float
@@ -616,10 +613,9 @@ static inline void raytracer_render_(RAYTRACER * rt, float pixelXCamSpaceOffset,
 
 	ALIGN_PREFIX float pixelCamSpaceX[ELEMENTS_PER_VECTOR] ALIGN_SUFFIX;
 
-	unsigned int pixelIndex = 0;
 	for (unsigned int pixelY = 0; pixelY < h; pixelY++) {
 
-		for (unsigned int pixelX = 0; pixelX < w; pixelX += X_INCREMENT, pixelIndex += X_INCREMENT) {
+		for (unsigned int pixelX = 0; pixelX < w; pixelX += ELEMENTS_PER_VECTOR) {
 
 
 			pixelCamSpaceX[0] = -1.0f + pixelXCamSpaceOffset * (x + pixelX);
@@ -691,6 +687,12 @@ static inline void raytracer_render_(RAYTRACER * rt, float pixelXCamSpaceOffset,
 			ALIGN_PREFIX float rayDirectionX_floats[ELEMENTS_PER_VECTOR] ALIGN_SUFFIX;
 			store_ps(rayDirectionX_floats, rayDirectionX);
 
+			ALIGN_PREFIX float rayDirectionY_floats[ELEMENTS_PER_VECTOR] ALIGN_SUFFIX;
+			store_ps(rayDirectionY_floats, rayDirectionY);
+
+			ALIGN_PREFIX float rayDirectionZ_floats[ELEMENTS_PER_VECTOR] ALIGN_SUFFIX;
+			store_ps(rayDirectionZ_floats, rayDirectionZ);
+
 			for (int i = 0; i < ELEMENTS_PER_VECTOR; i++) {
 				if (nearestIntersections[i] < INFINITY) {
 					rayHitInfo[rayHitInfoCount].pixelX = x + pixelX + i;
@@ -702,8 +704,8 @@ static inline void raytracer_render_(RAYTRACER * rt, float pixelXCamSpaceOffset,
 
 					// direction * t = point of intersection in 3d space
 					float px = rayDirectionX_floats[i] * nearestIntersections[i];
-					float py = get1_ss(rayDirectionY) * nearestIntersections[i];
-					float pz = get1_ss(rayDirectionZ) * nearestIntersections[i];
+					float py = rayDirectionY_floats[i] * nearestIntersections[i];
+					float pz = rayDirectionZ_floats[i] * nearestIntersections[i];
 
 					rayHitInfo[rayHitInfoCount].position[0] = px;
 					rayHitInfo[rayHitInfoCount].position[1] = py;
